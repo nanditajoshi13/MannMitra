@@ -1,37 +1,37 @@
 import os
 import streamlit as st
 from dotenv import load_dotenv
+from transformers import pipeline
 
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
-
 from langchain_google_genai import (
     ChatGoogleGenerativeAI,
-    GoogleGenerativeAIEmbeddings,
+    GoogleGenerativeAIEmbeddings
 )
-
 from langchain_community.document_loaders import PyPDFLoader
 
 
+# -------------------------------
+# Setup
+# -------------------------------
 load_dotenv()
+
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 if GOOGLE_API_KEY is None:
     raise ValueError("GOOGLE_API_KEY not found inside .env")
 
-os.environ['GOOGLE_API_KEY'] = GOOGLE_API_KEY
+os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
 
-
-DATA_FOLDER = 'docs'       
-DB_FOLDER = 'chromadb'
-
+DATA_FOLDER = "docs"
+DB_FOLDER = "chromadb"
 
 EMBEDDING_MODEL = "gemini-embedding-2"
-LLM_NAME = "gemini-3.5-flash-lite"  
+LLM_NAME = "gemini-3.5-flash-lite"
 
 CHUNK_SIZE = 400
 CHUNK_OVERLAP = 50
@@ -40,77 +40,50 @@ TOP_K = 2
 os.makedirs(DATA_FOLDER, exist_ok=True)
 
 
-embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
+# -------------------------------
+# Hugging Face Sentiment Model
+# -------------------------------
+sentiment_analyzer = pipeline(
+    "text-classification",
+    model="bhadresh-savani/distilbert-base-uncased-emotion"
+)
+
+
+# -------------------------------
+# RAG Setup
+# -------------------------------
+embeddings = GoogleGenerativeAIEmbeddings(
+    model=EMBEDDING_MODEL
+)
 
 vectordb = Chroma(
     persist_directory=DB_FOLDER,
-    embedding_function=embeddings,
+    embedding_function=embeddings
 )
 
-existing_sources = set()
-try:
-    stored = vectordb.get(include=["metadatas"])
-    if "metadatas" in stored:
-        existing_sources = {meta["source"] for meta in stored["metadatas"] if "source" in meta}
-except Exception:
-    existing_sources = set()
+retriever = vectordb.as_retriever(
+    search_kwargs={"k": TOP_K}
+)
 
-new_docs = []
-for file in os.listdir(DATA_FOLDER):
-    path = os.path.join(DATA_FOLDER, file)
+llm = ChatGoogleGenerativeAI(
+    model=LLM_NAME,
+    temperature=0.25,
+    max_output_tokens=300
+)
 
-    # Handle .md and .txt
-    if file.endswith(".md") or file.endswith(".txt"):
-        if file not in existing_sources:
-            with open(path, "r", encoding="utf-8") as f:
-                text = f.read()
-            new_docs.append(Document(
-                page_content=text,
-                metadata={
-                    "source": file,
-                    "category": "wellness",
-                    "target_issue": "general",
-                    "clinical_source": "student_resources",
-                    "urgency_level": "low"
-                }
-            ))
-            print("New text/markdown file added:", file)
-
-    # Handle .pdf
-    elif file.endswith(".pdf"):
-        if file not in existing_sources:
-            loader = PyPDFLoader(path)
-            pdf_docs = loader.load()
-            for d in pdf_docs:
-                d.metadata["source"] = file
-                d.metadata["category"] = "wellness"
-                d.metadata["target_issue"] = "general"
-                d.metadata["clinical_source"] = "student_resources"
-                d.metadata["urgency_level"] = "low"
-            new_docs.extend(pdf_docs)
-            print("New PDF added:", file)
-
-if new_docs:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-    )
-    chunks = splitter.split_documents(new_docs)
-    vectordb.add_documents(chunks)
-    print("New documents embedded and added to ChromaDB.")
-else:
-    print("No new documents to add.")
-
-retriever = vectordb.as_retriever(search_kwargs={"k": TOP_K})
-
-llm = ChatGoogleGenerativeAI(model=LLM_NAME, temperature=0.25, max_output_tokens=300)
 
 prompt = ChatPromptTemplate.from_template(
     """
     You are a supportive student wellness assistant.
-    Respond ONLY with coping techniques or institutional resources from the provided context.
-    Do NOT give medical diagnoses, prescriptions, or unverified advice.
-    If no relevant technique is found, respond empathetically and ask the student to describe their environment.
+
+    Respond ONLY with coping techniques or institutional resources
+    from the provided context.
+
+    Do NOT give medical diagnoses, prescriptions,
+    or unverified advice.
+
+    If no relevant technique is found, respond empathetically
+    and ask the student to describe their environment.
 
     Context:
     {context}
@@ -122,64 +95,379 @@ prompt = ChatPromptTemplate.from_template(
     """
 )
 
-def format_docs(docs):
-    return "\n\n".join(
-        f"[source: {doc.metadata.get('source','')}] "
-        f"(category: {doc.metadata.get('category','')})\n{doc.page_content}"
-        for doc in docs
-    )
-
 rag_chain = prompt | llm | StrOutputParser()
 
 
-st.set_page_config(
-    page_title='Student Wellness RAG',
-    page_icon="🌱",
-    layout="wide"
-)
+# -------------------------------
+# Combiner Layer
+# -------------------------------
+class MessageFormat:
 
-st.title("🌱 Student Wellness Assistant")
-st.write("Ask for coping strategies, grounding exercises, or campus resources.")
+    def __init__(
+        self,
+        msg_type,
+        content,
+        source=None,
+        sentiment=None,
+        audio=None
+    ):
+        self.msg_type = msg_type
+        self.content = content
+        self.source = source
+        self.sentiment = sentiment
+        self.audio = audio
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
 
-for message in st.session_state.messages:
-    with st.chat_message(message['role']):
-        st.markdown(message['content'])
+# -------------------------------
+# Chatbot Display
+# -------------------------------
+def display_chat(question, sentiment_msg, rag_msg):
 
-question = st.chat_input("Share how you're feeling...")
-
-exit_commands = ["quit", "exit", "clear", "bye", "goodbye"]
-
-if question and question.strip().lower() in exit_commands:
-    with st.chat_message("assistant"):
-        st.markdown("Take care! 🌸 The app will now close.")
-    st.stop()
-
-if question:
-    st.session_state.messages.append({"role": "user", "content": question})
-
+    # User Message
     with st.chat_message("user"):
-        st.markdown(question)
+        st.write(question)
 
-    docs = retriever.invoke(question)
+    # Assistant Response
+    with st.chat_message("assistant", avatar="🌱"):
 
-    if not docs:
-        answer = "I couldn't find that information in the provided documents."
-    else:
-        context = format_docs(docs)
-        answer = rag_chain.invoke({"context": context, "question": question})
+        # Retrieved Information
+        st.markdown("### 🌱 Here's something that might help")
 
-    with st.chat_message("assistant"):
-        st.markdown(answer)
-        if docs and "i couldn't find that information" not in answer.lower():
-            st.markdown("**Sources**")
-            shown = []
-            for doc in docs:
-                source = doc.metadata["source"]
-                if source not in shown:
-                    st.write(f"- {source} (category: {doc.metadata.get('category','')})")
-                    shown.append(source)
+        st.write(rag_msg.content)
 
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+        # Source
+        if rag_msg.source:
+            st.caption(f"📄 Source: {rag_msg.source}")
+
+        # Sentiment Information
+        label = sentiment_msg.sentiment.get(
+            "label",
+            "Unknown"
+        )
+
+        score = sentiment_msg.sentiment.get(
+            "score",
+            0.0
+        )
+
+        emoji_map = {
+            "joy": "😊",
+            "sadness": "😢",
+            "anger": "😠",
+            "fear": "😟",
+            "love": "❤️",
+            "surprise": "😲"
+        }
+
+        emoji = emoji_map.get(
+            label.lower(),
+            "🤔"
+        )
+
+        st.divider()
+
+        st.caption(
+            f"💭 Emotion detected: "
+            f"{emoji} **{label.capitalize()}** "
+            f"({score:.0%} confidence)"
+        )
+
+
+# -------------------------------
+# Streamlit App
+# -------------------------------
+def main():
+
+    # Page Configuration
+    st.set_page_config(
+        page_title="Wellness Assistant",
+        page_icon="🌱",
+        layout="centered"
+    )
+
+    # App Header
+    st.title("🌱 Unified Student Wellness Assistant")
+
+    st.caption(
+        "A safe space to share how you're feeling "
+        "and explore helpful wellness resources."
+    )
+
+    st.divider()
+
+
+    # -------------------------------
+    # Initialize Chat History
+    # -------------------------------
+    if "messages" not in st.session_state:
+
+        st.session_state.messages = []
+
+
+    # -------------------------------
+    # Display Previous Conversations
+    # -------------------------------
+    for message in st.session_state.messages:
+
+        display_chat(
+            message["question"],
+            message["sentiment"],
+            message["rag"]
+        )
+
+
+    # -------------------------------
+    # Chat Input
+    # -------------------------------
+    question = st.chat_input(
+        "Share how you're feeling..."
+    )
+
+
+    # -------------------------------
+    # Process User Input
+    # -------------------------------
+    if question:
+
+        # -------------------------------
+        # Sentiment Analysis
+        # -------------------------------
+        sentiment_result = sentiment_analyzer(
+            question
+        )[0]
+
+        sentiment_msg = MessageFormat(
+            msg_type="sentiment",
+            content=question,
+            sentiment={
+                "label": sentiment_result["label"],
+                "score": sentiment_result["score"]
+            }
+        )
+
+
+        # -------------------------------
+        # RAG Retrieval
+        # -------------------------------
+        docs = retriever.invoke(question)
+
+
+        if not docs:
+
+            rag_answer = (
+                "I couldn't find that information "
+                "in the provided documents."
+            )
+
+            rag_msg = MessageFormat(
+                msg_type="rag",
+                content=rag_answer
+            )
+
+
+        else:
+
+            # Combine retrieved documents
+            context = "\n\n".join(
+                doc.page_content
+                for doc in docs
+            )
+
+
+            # Generate RAG Response
+            rag_answer = rag_chain.invoke(
+                {
+                    "context": context,
+                    "question": question
+                }
+            )
+
+
+            # Create RAG Message
+            rag_msg = MessageFormat(
+                msg_type="rag",
+                content=rag_answer,
+                source=", ".join(
+                    doc.metadata.get(
+                        "source",
+                        ""
+                    )
+                    for doc in docs
+                )
+            )
+
+
+        # -------------------------------
+        # Store Conversation
+        # -------------------------------
+        st.session_state.messages.append(
+            {
+                "question": question,
+                "sentiment": sentiment_msg,
+                "rag": rag_msg
+            }
+        )
+
+
+        # -------------------------------
+        # Display New Conversation
+        # -------------------------------
+        display_chat(
+            question,
+            sentiment_msg,
+            rag_msg
+        )
+
+
+# -------------------------------
+# Run App
+# -------------------------------
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+# import os
+# import streamlit as st
+# from dotenv import load_dotenv
+# from transformers import pipeline
+
+# from langchain_core.documents import Document
+# from langchain_core.prompts import ChatPromptTemplate
+# from langchain_core.output_parsers import StrOutputParser
+# from langchain_text_splitters import RecursiveCharacterTextSplitter
+# from langchain_chroma import Chroma
+# from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+# from langchain_community.document_loaders import PyPDFLoader
+
+# # -------------------------------
+# # Setup
+# # -------------------------------
+# load_dotenv()
+# GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+# if GOOGLE_API_KEY is None:
+#     raise ValueError("GOOGLE_API_KEY not found inside .env")
+# os.environ['GOOGLE_API_KEY'] = GOOGLE_API_KEY
+
+# DATA_FOLDER = "docs"
+# DB_FOLDER = "chromadb"
+# EMBEDDING_MODEL = "gemini-embedding-2"
+# LLM_NAME = "gemini-3.5-flash-lite"
+# CHUNK_SIZE = 400
+# CHUNK_OVERLAP = 50
+# TOP_K = 2
+# os.makedirs(DATA_FOLDER, exist_ok=True)
+
+# # -------------------------------
+# # Hugging Face Sentiment Model
+# # -------------------------------
+# sentiment_analyzer = pipeline("text-classification", 
+#                               model="bhadresh-savani/distilbert-base-uncased-emotion")
+
+# # -------------------------------
+# # RAG Setup
+# # -------------------------------
+# embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
+# vectordb = Chroma(persist_directory=DB_FOLDER, embedding_function=embeddings)
+
+# retriever = vectordb.as_retriever(search_kwargs={"k": TOP_K})
+# llm = ChatGoogleGenerativeAI(model=LLM_NAME, temperature=0.25, max_output_tokens=300)
+
+# prompt = ChatPromptTemplate.from_template(
+#     """
+#     You are a supportive student wellness assistant.
+#     Respond ONLY with coping techniques or institutional resources from the provided context.
+#     Do NOT give medical diagnoses, prescriptions, or unverified advice.
+#     If no relevant technique is found, respond empathetically and ask the student to describe their environment.
+
+#     Context:
+#     {context}
+
+#     Student Message:
+#     {question}
+
+#     Answer:
+#     """
+# )
+# rag_chain = prompt | llm | StrOutputParser()
+
+# # -------------------------------
+# # Combiner Layer
+# # -------------------------------
+# class MessageFormat:
+#     def __init__(self, msg_type, content, source=None, sentiment=None, audio=None):
+#         self.msg_type = msg_type
+#         self.content = content
+#         self.source = source
+#         self.sentiment = sentiment
+#         self.audio = audio
+
+# def display_message(msg: MessageFormat):
+#     if msg.msg_type == "rag":
+#         st.markdown("### 📘 Retrieved Information")
+#         st.write(msg.content)
+#         if msg.source:
+#             st.caption(f"Source: {msg.source}")
+
+#     elif msg.msg_type == "sentiment":
+#         label = msg.sentiment.get("label", "Unknown")
+#         score = msg.sentiment.get("score", 0.0)
+#         emoji_map = {
+#             "joy": "😊", "sadness": "😢", "anger": "😠",
+#             "fear": "😟", "love": "❤️", "surprise": "😲"
+#         }
+#         emoji = emoji_map.get(label.lower(), "🤔")
+#         st.markdown(f"**Sentiment:** {emoji} {label} (Confidence: {score:.2f})")
+
+#     elif msg.msg_type == "voice":
+#         st.markdown("🎙️ Voice Response (placeholder)")
+#         st.write(msg.content if msg.content else "No voice model integrated yet.")
+
+# # -------------------------------
+# # Streamlit App
+# # -------------------------------
+# def main():
+#     st.set_page_config(page_title="Unified Wellness Assistant", page_icon="🌱", layout="wide")
+#     st.title("🌱 Unified Student Wellness Assistant")
+
+#     if "messages" not in st.session_state:
+#         st.session_state.messages = []
+
+#     question = st.chat_input("Share how you're feeling...")
+
+#     if question:
+#         # Sentiment Analysis
+#         sentiment_result = sentiment_analyzer(question)[0]
+#         sentiment_msg = MessageFormat(
+#             msg_type="sentiment",
+#             content=question,
+#             sentiment={"label": sentiment_result["label"], "score": sentiment_result["score"]}
+#         )
+
+#         # RAG Retrieval
+#         docs = retriever.invoke(question)
+#         if not docs:
+#             rag_answer = "I couldn't find that information in the provided documents."
+#             rag_msg = MessageFormat(msg_type="rag", content=rag_answer)
+#         else:
+#             context = "\n\n".join(doc.page_content for doc in docs)
+#             rag_answer = rag_chain.invoke({"context": context, "question": question})
+#             rag_msg = MessageFormat(
+#                 msg_type="rag",
+#                 content=rag_answer,
+#                 source=", ".join([doc.metadata.get("source", "") for doc in docs])
+#             )
+
+#         # Store & Display
+#         st.session_state.messages.append(sentiment_msg)
+#         st.session_state.messages.append(rag_msg)
+
+#     # Render all messages
+#     for msg in st.session_state.messages:
+#         display_message(msg)
+#         st.divider()
+
+# if __name__ == "__main__":
+#     main()
