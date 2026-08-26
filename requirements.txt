@@ -16,5 +16,6 @@ langchain-text-splitters
 bs4
 
 pypdf
+transformer
 
 # run pip install requirements.txt
