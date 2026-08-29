@@ -48,7 +48,6 @@ except Exception as exc:  # noqa: BLE001 - deliberately broad, this is a fallbac
     _HF_AVAILABLE = False
     _hf_pipeline = None
 
-
 # --------------------------------------------------------------------------
 # GoEmotions 28-class taxonomy, grouped by distress polarity
 # --------------------------------------------------------------------------
@@ -236,15 +235,12 @@ class RiskAnalyzer:
     def _emotion_distress_score(self, emotion: EmotionResult) -> float:
         if emotion.label in POSITIVE_EMOTION_LABELS:
             return 0.05
-
         if emotion.backend == "lexicon":
             # The lexicon fallback already returns a pre-tuned distress
             # weight for the matched word - use it directly.
             return round(min(1.0, emotion.score), 4)
-
         if emotion.label == "neutral":
             return 0.1
-
         weight = NEGATIVE_EMOTION_WEIGHTS.get(emotion.label, 0.4)
         # scale the emotion's base distress weight by model confidence,
         # keeping a floor so a confident-but-not-extreme reading still counts
@@ -268,7 +264,6 @@ class RiskAnalyzer:
     ) -> Tuple[EmotionResult, RiskAssessment]:
         history_scores = history_scores or []
         text = current_text or ""
-
         emotion = self.analyze_emotion(text)
         matched_patterns: List[str] = []
 
@@ -293,12 +288,10 @@ class RiskAnalyzer:
             if rx.search(text):
                 matched_patterns.append(rx.pattern)
                 score += 0.55
-
         for rx in self._moderate_re:
             if rx.search(text):
                 matched_patterns.append(rx.pattern)
                 score += 0.30
-
         score = min(1.0, score)
 
         # --- Multi-turn, non-dilution logic ---------------------------------
@@ -312,7 +305,6 @@ class RiskAnalyzer:
                 consecutive_distress += 1
             else:
                 break
-
         if consecutive_distress > 0:
             compound_boost = 0.15 * consecutive_distress
             score = min(1.0, score + compound_boost)
@@ -368,4 +360,4 @@ if __name__ == "__main__":
         history.append(risk.score)
         print(f"[{risk.tier:6}] score={risk.score:.2f} emotion={emo.label:12} text={s!r}")
         if risk.is_crisis:
-            print("  -> CRISIS RESPONSE TRIGGERED")
+            print("        -> CRISIS RESPONSE TRIGGERED")
