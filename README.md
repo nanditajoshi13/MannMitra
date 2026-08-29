@@ -3,38 +3,17 @@
 MannMitra combines two previously separate repositories into one
 production-grade Streamlit application:
 
-1. **Text, Triage & RAG** (`app.py`, `risk_analysis.py`, `rag_engine.py`, `./docs`)
+1. **Text, Triage & RAG**
    — GoEmotions sentiment analysis with a regex safety-net for crisis
    language, multi-turn distress compounding (GREEN / YELLOW / RED), and a
    persistent ChromaDB knowledge base of coping techniques and campus
    resources.
-2. **Speech Emotion & Voice Processing** (`./speech_engine`)
+2. **Speech Emotion & Voice Processing**
    — Whisper-Tiny transcription, a fine-tuned Wav2Vec2 acoustic classifier
    (with graceful, transcript-only fallback if the fine-tuned weights are
    absent), and a transparent non-clinical stress-scoring heuristic.
+           
 
-Text and voice messages are routed through the **exact same**
-`risk_analysis.assess_risk` → `rag_engine.retrieve` → Gemini pipeline, so
-behavior is identical regardless of input modality.
-
-## Project layout
-
-```
-MannMitra/
-├── app.py                     # Unified Streamlit entrypoint
-├── risk_analysis.py           # Sentiment + crisis triage
-├── rag_engine.py              # ChromaDB knowledge retrieval
-├── requirements.txt
-├── .env.example
-├── docs/                      # Knowledge base (auto-seeded on first run)
-└── speech_engine/             # Voice subsystem (dynamically resolved by app.py)
-    ├── __init__.py
-    ├── speech_to_text.py       # Whisper STT
-    ├── speech_analysis.py      # Acoustic + transcript fusion
-    ├── stress_interpretation.py# 0-100 non-clinical stress heuristic
-    ├── predict_speech_emotion.py # Wav2Vec2 acoustic classifier + audio I/O
-    └── models/ravdess_wav2vec2_finetuned/best/   # (optional) fine-tuned weights
-```
 
 ## Setup
 
