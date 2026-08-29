@@ -1,473 +1,243 @@
+"""
+app.py
+======
+MANNMITRA - Streamlit chat application and live analytics dashboard.
+
+Orchestrates risk_analysis.RiskAnalyzer, rag_engine.RAGEngine, and
+Google GenAI (gemini-1.5-flash) into an empathetic peer-listener chat
+experience with a live triage sidebar.
+"""
+
+from __future__ import annotations
+
 import os
+import logging
+from typing import List, Optional
+
 import streamlit as st
-from dotenv import load_dotenv
-from transformers import pipeline
 
-from langchain_core.documents import Document
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_chroma import Chroma
-from langchain_google_genai import (
-    ChatGoogleGenerativeAI,
-    GoogleGenerativeAIEmbeddings
-)
-from langchain_community.document_loaders import PyPDFLoader
+from risk_analysis import RiskAnalyzer, EmotionResult, RiskAssessment
+from rag_engine import RAGEngine, RAGContext
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("mannmitra.app")
 
-# -------------------------------
-# Setup
-# -------------------------------
-load_dotenv()
+# --------------------------------------------------------------------------
+# Environment / API key harmonization
+# --------------------------------------------------------------------------
+os.environ["GEMINI_API_KEY"] = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+_GENAI_AVAILABLE = False
+_genai_client = None
+try:
+    from google import genai as _google_genai
 
-if GOOGLE_API_KEY is None:
-    raise ValueError("GOOGLE_API_KEY not found inside .env")
+    if os.environ.get("GEMINI_API_KEY"):
+        _genai_client = _google_genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        _GENAI_AVAILABLE = True
+    else:
+        logger.warning("No GEMINI_API_KEY / GOOGLE_API_KEY found in environment.")
+except Exception as exc:  # noqa: BLE001
+    logger.warning("google-genai unavailable (%s). LLM responses will use a static fallback.", exc)
+    _GENAI_AVAILABLE = False
 
-os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
-
-DATA_FOLDER = "docs"
-DB_FOLDER = "chromadb"
-
-EMBEDDING_MODEL = "gemini-embedding-2"
-LLM_NAME = "gemini-3.5-flash-lite"
-
-CHUNK_SIZE = 400
-CHUNK_OVERLAP = 50
-TOP_K = 2
-
-os.makedirs(DATA_FOLDER, exist_ok=True)
-
-
-# -------------------------------
-# Hugging Face Sentiment Model
-# -------------------------------
-sentiment_analyzer = pipeline(
-    "text-classification",
-    model="bhadresh-savani/distilbert-base-uncased-emotion"
+SYSTEM_PROMPT = (
+    "You are MannMitra, a warm, empathetic peer listener for Indian college "
+    "students. You are NOT a therapist and never diagnose. Respond in 2-3 "
+    "concise, natural sentences, in a caring, non-clinical, conversational "
+    "tone - like a supportive friend, not a textbook. Validate the "
+    "student's feelings before offering any gentle suggestion. If helpful "
+    "context about a coping technique or campus resource is provided to "
+    "you, weave it naturally into your own words as a friendly suggestion "
+    "- never quote titles, filenames, or headers verbatim, and never say "
+    "things like '[Source: ...]'. Keep responses grounded, human, and "
+    "free of clinical jargon. Talk in non-repeating semi-casual patterns"
 )
 
-
-# -------------------------------
-# RAG Setup
-# -------------------------------
-embeddings = GoogleGenerativeAIEmbeddings(
-    model=EMBEDDING_MODEL
-)
-
-vectordb = Chroma(
-    persist_directory=DB_FOLDER,
-    embedding_function=embeddings
-)
-
-retriever = vectordb.as_retriever(
-    search_kwargs={"k": TOP_K}
-)
-
-llm = ChatGoogleGenerativeAI(
-    model=LLM_NAME,
-    temperature=0.25,
-    max_output_tokens=300
-)
+TIER_BADGES = {"GREEN": "🟢 GREEN", "YELLOW": "🟡 YELLOW", "RED": "🔴 RED"}
+TIER_COLORS = {"GREEN": "#2ecc71", "YELLOW": "#f1c40f", "RED": "#e74c3c"}
 
 
-prompt = ChatPromptTemplate.from_template(
-    """
-    You are a supportive student wellness assistant.
-
-    Respond ONLY with coping techniques or institutional resources
-    from the provided context.
-
-    Do NOT give medical diagnoses, prescriptions,
-    or unverified advice.
-
-    If no relevant technique is found, respond empathetically
-    and ask the student to describe their environment.
-
-    Context:
-    {context}
-
-    Student Message:
-    {question}
-
-    Answer:
-    """
-)
-
-rag_chain = prompt | llm | StrOutputParser()
+# --------------------------------------------------------------------------
+# Cached singletons
+# --------------------------------------------------------------------------
+@st.cache_resource(show_spinner="Loading risk analyzer...")
+def get_risk_analyzer() -> RiskAnalyzer:
+    return RiskAnalyzer()
 
 
-# -------------------------------
-# Combiner Layer
-# -------------------------------
-class MessageFormat:
-
-    def __init__(
-        self,
-        msg_type,
-        content,
-        source=None,
-        sentiment=None,
-        audio=None
-    ):
-        self.msg_type = msg_type
-        self.content = content
-        self.source = source
-        self.sentiment = sentiment
-        self.audio = audio
+@st.cache_resource(show_spinner="Loading knowledge base...")
+def get_rag_engine() -> RAGEngine:
+    return RAGEngine()
 
 
-# -------------------------------
-# Chatbot Display
-# -------------------------------
-def display_chat(question, sentiment_msg, rag_msg):
-
-    # User Message
-    with st.chat_message("user"):
-        st.write(question)
-
-    # Assistant Response
-    with st.chat_message("assistant", avatar="🌱"):
-
-        # Retrieved Information
-        st.markdown("### 🌱 Here's something that might help")
-
-        st.write(rag_msg.content)
-
-        # Source
-        if rag_msg.source:
-            st.caption(f"📄 Source: {rag_msg.source}")
-
-        # Sentiment Information
-        label = sentiment_msg.sentiment.get(
-            "label",
-            "Unknown"
+# --------------------------------------------------------------------------
+# LLM call
+# --------------------------------------------------------------------------
+def generate_reply(user_text: str, chat_history: List[dict], rag_context: RAGContext) -> str:
+    if not _GENAI_AVAILABLE or _genai_client is None:
+        return (
+            "I hear you, and I'm really glad you shared that with me. "
+            "Thanks for opening up - want to tell me a bit more about what's "
+            "been going on?"
         )
 
-        score = sentiment_msg.sentiment.get(
-            "score",
-            0.0
+    context_note = ""
+    if rag_context.is_used and rag_context.retrieved_documents:
+        joined = "\n\n".join(rag_context.retrieved_documents[:2])
+        context_note = (
+            "\n\nHelpful background you may draw on (do not quote directly, "
+            f"paraphrase naturally):\n{joined}"
         )
 
-        emoji_map = {
-            "joy": "😊",
-            "sadness": "😢",
-            "anger": "😠",
-            "fear": "😟",
-            "love": "❤️",
-            "surprise": "😲"
-        }
+    convo_lines = []
+    for turn in chat_history[-6:]:
+        role = "Student" if turn["role"] == "user" else "MannMitra"
+        convo_lines.append(f"{role}: {turn['content']}")
+    convo_text = "\n".join(convo_lines)
 
-        emoji = emoji_map.get(
-            label.lower(),
-            "🤔"
-        )
-
-        st.divider()
-
-        st.caption(
-            f"💭 Emotion detected: "
-            f"{emoji} **{label.capitalize()}** "
-            f"({score:.0%} confidence)"
-        )
-
-
-# -------------------------------
-# Streamlit App
-# -------------------------------
-def main():
-
-    # Page Configuration
-    st.set_page_config(
-        page_title="Wellness Assistant",
-        page_icon="🌱",
-        layout="centered"
+    prompt = (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"Recent conversation:\n{convo_text}\n\n"
+        f"Student's latest message: {user_text}"
+        f"{context_note}\n\n"
+        "Respond as MannMitra in 2-3 sentences:"
     )
 
-    # App Header
-    st.title("🌱 Unified Student Wellness Assistant")
+    try:
+        response = _genai_client.models.generate_content(
+            model="gemini-3.5-flash-lite",
+            contents=prompt,
+        )
+        text = (response.text or "").strip()
+        return text if text else "I'm here with you - can you tell me a little more?"
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Gemini generation failed: %s", exc)
+        return (
+            "I'm here and listening, even though I'm having a little trouble "
+            "finding the right words right now. Can you tell me more about "
+            "how you're feeling?"
+        )
 
-    st.caption(
-        "A safe space to share how you're feeling "
-        "and explore helpful wellness resources."
-    )
+
+# --------------------------------------------------------------------------
+# Streamlit page setup
+# --------------------------------------------------------------------------
+st.set_page_config(page_title="MannMitra", page_icon="🧠", layout="wide")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []  # list of {"role", "content", "tier", "emotion", "rag_used"}
+if "history_scores" not in st.session_state:
+    st.session_state.history_scores = []
+if "last_assessment" not in st.session_state:
+    st.session_state.last_assessment = None
+if "last_emotion" not in st.session_state:
+    st.session_state.last_emotion = None
+if "last_rag" not in st.session_state:
+    st.session_state.last_rag = None
+
+analyzer = get_risk_analyzer()
+rag_engine = get_rag_engine()
+
+# --------------------------------------------------------------------------
+# Sidebar - live analytics
+# --------------------------------------------------------------------------
+with st.sidebar:
+    st.title("🧠 MannMitra")
+    st.caption("Live wellbeing analytics")
+
+    st.subheader("Triage Status")
+    if st.session_state.last_assessment is not None:
+        tier = st.session_state.last_assessment.tier
+        score = st.session_state.last_assessment.score
+    else:
+        tier, score = "GREEN", 0.0
+
+    st.markdown(f"### {TIER_BADGES[tier]}")
+    st.progress(min(1.0, max(0.0, score)))
+    st.caption(f"Composite Distress Score: {score:.2f}")
+
+    st.subheader("Emotion Breakdown")
+    if st.session_state.last_emotion is not None and st.session_state.last_emotion.all_emotions:
+        top_emotions = sorted(
+            st.session_state.last_emotion.all_emotions.items(), key=lambda kv: kv[1], reverse=True
+        )[:5]
+        for label, prob in top_emotions:
+            st.write(f"**{label}**")
+            st.progress(min(1.0, max(0.0, float(prob))))
+    else:
+        st.caption("No emotion data yet - send a message to begin.")
+
+    st.subheader("Knowledge Retrieval (RAG)")
+    if st.session_state.last_rag is not None and st.session_state.last_rag.is_used:
+        sources = ", ".join(sorted(set(st.session_state.last_rag.sources)))
+        st.success(f"✓ Injected: {sources}")
+    else:
+        st.info("Standby - no relevant resource retrieved.")
 
     st.divider()
-
-
-    # -------------------------------
-    # Initialize Chat History
-    # -------------------------------
-    if "messages" not in st.session_state:
-
-        st.session_state.messages = []
-
-
-    # -------------------------------
-    # Display Previous Conversations
-    # -------------------------------
-    for message in st.session_state.messages:
-
-        display_chat(
-            message["question"],
-            message["sentiment"],
-            message["rag"]
-        )
-
-
-    # -------------------------------
-    # Chat Input
-    # -------------------------------
-    question = st.chat_input(
-        "Share how you're feeling..."
+    st.subheader("📞 Verified Helplines (India)")
+    st.markdown(
+        "- **Tele-MANAS**: `14416` (24/7, free)\n"
+        "- **KIRAN**: `1800-599-0019` (24/7, toll-free)"
+    )
+    st.caption(
+        "If you or someone you know is in immediate danger, please contact "
+        "local emergency services or go to the nearest hospital."
     )
 
+# --------------------------------------------------------------------------
+# Main chat area
+# --------------------------------------------------------------------------
+st.header("Chat with MannMitra")
+st.caption("A private space to talk things through. This is peer support, not a substitute for professional care.")
 
-    # -------------------------------
-    # Process User Input
-    # -------------------------------
-    if question:
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        if msg["role"] == "assistant" and "tier" in msg:
+            st.caption(
+                f"Tier: {msg['tier']} · Emotion: {msg.get('emotion', 'n/a')} · "
+                f"Knowledge Injected: {'Yes' if msg.get('rag_used') else 'No'}"
+            )
 
-        # -------------------------------
-        # Sentiment Analysis
-        # -------------------------------
-        sentiment_result = sentiment_analyzer(
-            question
-        )[0]
+user_input = st.chat_input("Share what's on your mind...")
 
-        sentiment_msg = MessageFormat(
-            msg_type="sentiment",
-            content=question,
-            sentiment={
-                "label": sentiment_result["label"],
-                "score": sentiment_result["score"]
-            }
+if user_input:
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    emotion, assessment = analyzer.assess_risk(user_input, st.session_state.history_scores)
+    st.session_state.history_scores.append(assessment.score)
+    st.session_state.last_assessment = assessment
+    st.session_state.last_emotion = emotion
+
+    if assessment.is_crisis:
+        rag_context = RAGContext(is_used=False)
+        reply = RiskAnalyzer.get_crisis_response()
+    else:
+        rag_context = rag_engine.retrieve(user_input, assessment.score)
+        history_for_llm = st.session_state.messages
+        reply = generate_reply(user_input, history_for_llm, rag_context)
+
+    st.session_state.last_rag = rag_context
+
+    with st.chat_message("assistant"):
+        st.markdown(reply)
+        st.caption(
+            f"Tier: {assessment.tier} · Emotion: {emotion.label} · "
+            f"Knowledge Injected: {'Yes' if rag_context.is_used else 'No'}"
         )
 
+    st.session_state.messages.append(
+        {
+            "role": "assistant",
+            "content": reply,
+            "tier": assessment.tier,
+            "emotion": emotion.label,
+            "rag_used": rag_context.is_used,
+        }
+    )
 
-        # -------------------------------
-        # RAG Retrieval
-        # -------------------------------
-        docs = retriever.invoke(question)
-
-
-        if not docs:
-
-            rag_answer = (
-                "I couldn't find that information "
-                "in the provided documents."
-            )
-
-            rag_msg = MessageFormat(
-                msg_type="rag",
-                content=rag_answer
-            )
-
-
-        else:
-
-            # Combine retrieved documents
-            context = "\n\n".join(
-                doc.page_content
-                for doc in docs
-            )
-
-
-            # Generate RAG Response
-            rag_answer = rag_chain.invoke(
-                {
-                    "context": context,
-                    "question": question
-                }
-            )
-
-
-            # Create RAG Message
-            rag_msg = MessageFormat(
-                msg_type="rag",
-                content=rag_answer,
-                source=", ".join(
-                    doc.metadata.get(
-                        "source",
-                        ""
-                    )
-                    for doc in docs
-                )
-            )
-
-
-        # -------------------------------
-        # Store Conversation
-        # -------------------------------
-        st.session_state.messages.append(
-            {
-                "question": question,
-                "sentiment": sentiment_msg,
-                "rag": rag_msg
-            }
-        )
-
-
-        # -------------------------------
-        # Display New Conversation
-        # -------------------------------
-        display_chat(
-            question,
-            sentiment_msg,
-            rag_msg
-        )
-
-
-# -------------------------------
-# Run App
-# -------------------------------
-if __name__ == "__main__":
-    main()
-
-
-
-
-
-# import os
-# import streamlit as st
-# from dotenv import load_dotenv
-# from transformers import pipeline
-
-# from langchain_core.documents import Document
-# from langchain_core.prompts import ChatPromptTemplate
-# from langchain_core.output_parsers import StrOutputParser
-# from langchain_text_splitters import RecursiveCharacterTextSplitter
-# from langchain_chroma import Chroma
-# from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-# from langchain_community.document_loaders import PyPDFLoader
-
-# # -------------------------------
-# # Setup
-# # -------------------------------
-# load_dotenv()
-# GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-# if GOOGLE_API_KEY is None:
-#     raise ValueError("GOOGLE_API_KEY not found inside .env")
-# os.environ['GOOGLE_API_KEY'] = GOOGLE_API_KEY
-
-# DATA_FOLDER = "docs"
-# DB_FOLDER = "chromadb"
-# EMBEDDING_MODEL = "gemini-embedding-2"
-# LLM_NAME = "gemini-3.5-flash-lite"
-# CHUNK_SIZE = 400
-# CHUNK_OVERLAP = 50
-# TOP_K = 2
-# os.makedirs(DATA_FOLDER, exist_ok=True)
-
-# # -------------------------------
-# # Hugging Face Sentiment Model
-# # -------------------------------
-# sentiment_analyzer = pipeline("text-classification", 
-#                               model="bhadresh-savani/distilbert-base-uncased-emotion")
-
-# # -------------------------------
-# # RAG Setup
-# # -------------------------------
-# embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
-# vectordb = Chroma(persist_directory=DB_FOLDER, embedding_function=embeddings)
-
-# retriever = vectordb.as_retriever(search_kwargs={"k": TOP_K})
-# llm = ChatGoogleGenerativeAI(model=LLM_NAME, temperature=0.25, max_output_tokens=300)
-
-# prompt = ChatPromptTemplate.from_template(
-#     """
-#     You are a supportive student wellness assistant.
-#     Respond ONLY with coping techniques or institutional resources from the provided context.
-#     Do NOT give medical diagnoses, prescriptions, or unverified advice.
-#     If no relevant technique is found, respond empathetically and ask the student to describe their environment.
-
-#     Context:
-#     {context}
-
-#     Student Message:
-#     {question}
-
-#     Answer:
-#     """
-# )
-# rag_chain = prompt | llm | StrOutputParser()
-
-# # -------------------------------
-# # Combiner Layer
-# # -------------------------------
-# class MessageFormat:
-#     def __init__(self, msg_type, content, source=None, sentiment=None, audio=None):
-#         self.msg_type = msg_type
-#         self.content = content
-#         self.source = source
-#         self.sentiment = sentiment
-#         self.audio = audio
-
-# def display_message(msg: MessageFormat):
-#     if msg.msg_type == "rag":
-#         st.markdown("### 📘 Retrieved Information")
-#         st.write(msg.content)
-#         if msg.source:
-#             st.caption(f"Source: {msg.source}")
-
-#     elif msg.msg_type == "sentiment":
-#         label = msg.sentiment.get("label", "Unknown")
-#         score = msg.sentiment.get("score", 0.0)
-#         emoji_map = {
-#             "joy": "😊", "sadness": "😢", "anger": "😠",
-#             "fear": "😟", "love": "❤️", "surprise": "😲"
-#         }
-#         emoji = emoji_map.get(label.lower(), "🤔")
-#         st.markdown(f"**Sentiment:** {emoji} {label} (Confidence: {score:.2f})")
-
-#     elif msg.msg_type == "voice":
-#         st.markdown("🎙️ Voice Response (placeholder)")
-#         st.write(msg.content if msg.content else "No voice model integrated yet.")
-
-# # -------------------------------
-# # Streamlit App
-# # -------------------------------
-# def main():
-#     st.set_page_config(page_title="Unified Wellness Assistant", page_icon="🌱", layout="wide")
-#     st.title("🌱 Unified Student Wellness Assistant")
-
-#     if "messages" not in st.session_state:
-#         st.session_state.messages = []
-
-#     question = st.chat_input("Share how you're feeling...")
-
-#     if question:
-#         # Sentiment Analysis
-#         sentiment_result = sentiment_analyzer(question)[0]
-#         sentiment_msg = MessageFormat(
-#             msg_type="sentiment",
-#             content=question,
-#             sentiment={"label": sentiment_result["label"], "score": sentiment_result["score"]}
-#         )
-
-#         # RAG Retrieval
-#         docs = retriever.invoke(question)
-#         if not docs:
-#             rag_answer = "I couldn't find that information in the provided documents."
-#             rag_msg = MessageFormat(msg_type="rag", content=rag_answer)
-#         else:
-#             context = "\n\n".join(doc.page_content for doc in docs)
-#             rag_answer = rag_chain.invoke({"context": context, "question": question})
-#             rag_msg = MessageFormat(
-#                 msg_type="rag",
-#                 content=rag_answer,
-#                 source=", ".join([doc.metadata.get("source", "") for doc in docs])
-#             )
-
-#         # Store & Display
-#         st.session_state.messages.append(sentiment_msg)
-#         st.session_state.messages.append(rag_msg)
-
-#     # Render all messages
-#     for msg in st.session_state.messages:
-#         display_message(msg)
-#         st.divider()
-
-# if __name__ == "__main__":
-#     main()
+    st.rerun()
